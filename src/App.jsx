@@ -679,7 +679,7 @@ function InvTable({inventory,setInventory,locationId,invItems,stations,vehicles}
       <div style={{overflowX:"auto"}}>
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
           <thead><tr style={{color:C.textDim,fontSize:11,fontFamily:C.font,textTransform:"uppercase",letterSpacing:"0.06em"}}>
-            {["Item","Category","Qty","Par","Order Pt","Status","Earliest Expiry","Lot(s)","Updated",""].map(h=><th key={h} style={{textAlign:["Qty","Par","Order Pt"].includes(h)?"center":"left",paddingBottom:10,fontWeight:600,paddingRight:12}}>{h}</th>)}
+            {["Item","Category","Qty","Par","Order Pt","Status","Earliest Expiry","Lot(s)","Updated","Last Verified",""].map(h=><th key={h} style={{textAlign:["Qty","Par","Order Pt"].includes(h)?"center":"left",paddingBottom:10,fontWeight:600,paddingRight:12}}>{h}</th>)}
           </tr></thead>
           <tbody>
             {items.map(item=>{
@@ -688,6 +688,8 @@ function InvTable({inventory,setInventory,locationId,invItems,stations,vehicles}
               const days=daysUntilExpiry(e.expiry);
               const lots=e.lots||[];
               const activeLots=lots.filter(l=>l.qty>0);
+              const daysSinceSeen=e.lastSeen?Math.floor((new Date()-new Date(e.lastSeen))/(1000*60*60*24)):null;
+              const seenColor=daysSinceSeen===null?C.textDim:daysSinceSeen===0?C.green:daysSinceSeen<=1?C.teal:daysSinceSeen<=3?C.yellow:C.red;
               return(
                 <tr key={item.id} style={{borderTop:`1px solid ${C.border}`}}>
                   <td style={{padding:"9px 12px 9px 0",color:C.text,fontWeight:600}}>{item.name}</td>
@@ -711,6 +713,15 @@ function InvTable({inventory,setInventory,locationId,invItems,stations,vehicles}
                     }
                   </td>
                   <td style={{padding:"9px 12px 9px 0",color:C.textMid,fontSize:12,fontFamily:C.font}}>{e.lastUpdated}</td>
+                  <td style={{padding:"9px 12px 9px 0",fontSize:11,fontFamily:C.font}}>
+                    {e.lastSeen
+                      ? <div>
+                          <div style={{color:seenColor,fontWeight:700}}>{daysSinceSeen===0?"Today":daysSinceSeen===1?"Yesterday":`${daysSinceSeen}d ago`}</div>
+                          <div style={{color:C.textDim,fontSize:10}}>{e.lastSeenUnit||""} · {e.lastSeenBy||""}</div>
+                        </div>
+                      : <span style={{color:C.textDim}}>—</span>
+                    }
+                  </td>
                   <td style={{padding:"9px 0",whiteSpace:"nowrap"}}>
                     <div style={{display:"flex",gap:5}}>
                       <button onClick={()=>setEditModal({item,entry:e,mode:"receive"})} style={{background:C.greenDim,border:`1px solid ${C.greenBorder}`,borderRadius:4,padding:"3px 8px",cursor:"pointer",color:C.green,fontSize:11,fontWeight:700}}>+ Receive</button>
@@ -1270,10 +1281,11 @@ function StationSelect({onSelect}){
   );
 }
 
-function CrewPortal({session,templates,submissions,setSubmissions,inventory,vehicles,invItems}){
+function CrewPortal({session,templates,submissions,setSubmissions,inventory,setInventory,vehicles,invItems}){
   const [view,setView]=useState("home");
   const [activeTpl,setActiveTpl]=useState(null);
   const [submitted,setSubmitted]=useState(false);
+  const [invUpdateSummary,setInvUpdateSummary]=useState(null); // {confirmed,discrepancies}
 
   const crewName=`${session.firstName} ${session.lastName}`;
   const unitObj=vehicles.find(v=>v.id===session.unit);
@@ -1288,16 +1300,105 @@ function CrewPortal({session,templates,submissions,setSubmissions,inventory,vehi
   const catIcons={Vehicle:"🚑",Medications:"💊",Equipment:"🔧",Incident:"📋",Custom:"📝"};
   const todayStr=new Date().toISOString().split("T")[0];
 
+  // ── Vehicle check inventory sync ──────────────────────────────────────
+  const processVehicleCheckInventory=(data,unitId)=>{
+    if(!inventory||!unitId) return {confirmed:0,discrepancies:[]};
+    const itmList=invItems||SEED_ITEMS;
+    const now=new Date().toISOString();
+    const today=now.split("T")[0];
+    const updatedInv={...inventory};
+    const discrepancies=[];
+    let confirmed=0;
+
+    // Scan all form answers for numeric values — these are crew-reported counts
+    // Fields whose label includes a tracked item name are matched
+    Object.entries(data).forEach(([fieldId,rawVal])=>{
+      const parsed=parseInt(rawVal,10);
+      if(isNaN(parsed)||parsed<0) return; // skip non-numeric answers
+      // Try to match this field to an inventory item by name keyword
+      const allFields=activeTpl?.sections?.flatMap(s=>s.fields)||[];
+      const field=allFields.find(f=>f.id===fieldId);
+      if(!field) return;
+      const label=(field.label||"").toLowerCase();
+      const matchedItem=itmList.find(item=>{
+        const nm=item.name.toLowerCase();
+        // Match if label contains a meaningful part of the item name (3+ char word)
+        return nm.split(/\s+/).filter(w=>w.length>=3).some(w=>label.includes(w));
+      });
+      if(!matchedItem) return;
+      const key=`${unitId}__${matchedItem.id}`;
+      const existing=updatedInv[key]||{qty:0,expiry:null,lastUpdated:today,lots:[]};
+      const expected=existing.qty;
+      const reported=parsed;
+      // Always update lastSeen regardless of discrepancy
+      updatedInv[key]={
+        ...existing,
+        lastSeen:today,
+        lastSeenAt:now,
+        lastSeenUnit:unitCode,
+        lastSeenBy:crewName,
+        lastSeenEmployeeId:session.employeeId,
+      };
+      confirmed++;
+      if(reported!==expected){
+        discrepancies.push({
+          itemId:matchedItem.id,
+          itemName:matchedItem.name,
+          unit:matchedItem.unit,
+          expected,
+          reported,
+          diff:reported-expected,
+          fieldLabel:field.label,
+        });
+        // Update inventory qty to match crew's physical count — crew is ground truth
+        updatedInv[key]={...updatedInv[key],qty:reported,lastUpdated:today};
+      }
+    });
+
+    // Also do a broad "confirmed present" pass for all items on this vehicle —
+    // any item on the vehicle gets a lastSeen stamp even if no count was entered,
+    // as the form submission itself confirms the crew was physically on the vehicle
+    itmList.forEach(item=>{
+      const key=`${unitId}__${item.id}`;
+      if(updatedInv[key]&&!updatedInv[key].lastSeen){
+        updatedInv[key]={...updatedInv[key],lastSeen:today,lastSeenAt:now,lastSeenUnit:unitCode,lastSeenBy:crewName,lastSeenEmployeeId:session.employeeId};
+      }
+    });
+
+    if(setInventory){
+      setInventory(updatedInv);
+      store.set("mps_inventory",updatedInv);
+    }
+    return{confirmed,discrepancies};
+  };
+
   if(view==="form"&&activeTpl) return (
     <FormView
       template={activeTpl}
       crewInfo={{name:crewName,station:stationName,unit:unitCode,shift:session.shift}}
       submitted={submitted}
       onSubmit={data=>{
+        const isVehicleCheck=activeTpl.category==="Vehicle"||(activeTpl.name||"").toLowerCase().includes("vehicle");
+        // Build inventory discrepancy metadata if this is a vehicle check
+        let invDiscrepancies=[];
+        let invConfirmed=0;
+        if(isVehicleCheck&&session.unit){
+          const result=processVehicleCheckInventory(data,session.unit);
+          invDiscrepancies=result.discrepancies;
+          invConfirmed=result.confirmed;
+          setInvUpdateSummary({confirmed:invConfirmed,discrepancies:invDiscrepancies});
+          setTimeout(()=>setInvUpdateSummary(null),8000);
+        }
         const sub={id:uid(),templateId:activeTpl.id,templateName:activeTpl.name,category:activeTpl.category,
           submittedAt:new Date().toISOString(),data,status:"submitted",
           crewName,station:stationName,unit:unitCode,shift:session.shift,
-          employeeId:session.employeeId,acknowledgement:null};
+          employeeId:session.employeeId,acknowledgement:null,
+          // Attach inventory sync metadata to submission record
+          inventorySync:isVehicleCheck?{
+            unitId:session.unit,unitCode,confirmedItems:invConfirmed,
+            discrepancies:invDiscrepancies,syncedAt:new Date().toISOString(),
+          }:null,
+        };
         const u=[sub,...submissions];
         setSubmissions(u);store.set("mps_submissions",u);
         setSubmitted(true);
@@ -1346,25 +1447,64 @@ function CrewPortal({session,templates,submissions,setSubmissions,inventory,vehi
           </div>
         )}
 
+        {/* Inventory sync result banner — shown after vehicle check submission */}
+        {invUpdateSummary&&(
+          <div style={{background:invUpdateSummary.discrepancies.length>0?C.yellowDim:C.greenDim,border:`1px solid ${invUpdateSummary.discrepancies.length>0?C.yellowBorder:C.greenBorder}`,borderRadius:C.radius,padding:"14px 18px",marginBottom:20}}>
+            <div style={{fontSize:13,fontWeight:700,color:invUpdateSummary.discrepancies.length>0?C.yellow:C.green,marginBottom:6}}>
+              {invUpdateSummary.discrepancies.length>0?"⚠ Inventory Sync — Discrepancies Found":"✓ Inventory Synced Successfully"}
+            </div>
+            <div style={{fontSize:12,color:C.textMid,marginBottom:invUpdateSummary.discrepancies.length>0?10:0}}>
+              {unitCode} inventory updated · {invUpdateSummary.confirmed} item location{invUpdateSummary.confirmed!==1?"s":""} confirmed
+            </div>
+            {invUpdateSummary.discrepancies.length>0&&(
+              <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                {invUpdateSummary.discrepancies.map((d,i)=>(
+                  <div key={i} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:C.radiusSm,padding:"8px 12px",fontSize:12,fontFamily:C.font,display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                    <span style={{color:C.text,fontWeight:700}}>{d.itemName}</span>
+                    <span>
+                      <span style={{color:C.textMid}}>System: </span><span style={{color:C.text,fontWeight:700}}>{d.expected} {d.unit}</span>
+                      <span style={{color:C.textMid,margin:"0 8px"}}>→</span>
+                      <span style={{color:C.textMid}}>Physical count: </span><span style={{color:d.diff<0?C.red:C.yellow,fontWeight:700}}>{d.reported} {d.unit}</span>
+                      <span style={{color:d.diff<0?C.red:C.yellow,marginLeft:8,fontWeight:700}}>{d.diff>0?"+":""}{d.diff}</span>
+                    </span>
+                  </div>
+                ))}
+                <div style={{fontSize:11,color:C.textMid,marginTop:4}}>Inventory counts updated to match physical count. Superintendent has been notified.</div>
+              </div>
+            )}
+          </div>
+        )}
+
         {view==="vehicle-inv"&&vehicleInv&&(
           <div style={{marginBottom:28}}>
-            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:4}}>
               <Btn onClick={()=>setView("home")}>← Back</Btn>
               <div style={{fontSize:18,fontWeight:800,color:C.text}}>{unitCode} — Vehicle Inventory</div>
             </div>
+            <div style={{fontSize:12,color:C.textMid,marginBottom:16,fontFamily:C.font}}>Last seen timestamps update automatically when a vehicle check is submitted.</div>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
               <thead><tr style={{color:C.textDim,fontSize:11,fontFamily:C.font,textTransform:"uppercase",letterSpacing:"0.06em"}}>
-                {["Item","Category","Qty","Par","Status","Expiry"].map(h=><th key={h} style={{textAlign:"left",paddingBottom:8,fontWeight:600,paddingRight:12}}>{h}</th>)}
+                {["Item","Category","Qty","Par","Status","Expiry","Last Verified"].map(h=><th key={h} style={{textAlign:"left",paddingBottom:8,fontWeight:600,paddingRight:12}}>{h}</th>)}
               </tr></thead>
               <tbody>{unitInvItems.map(item=>{
                 const days=daysUntilExpiry(item.expiry);
+                const lastSeen=item.lastSeen;
+                const daysSinceSeen=lastSeen?Math.floor((new Date()-new Date(lastSeen))/(1000*60*60*24)):null;
+                const seenColor=daysSinceSeen===null?C.textDim:daysSinceSeen===0?C.green:daysSinceSeen<=1?C.teal:daysSinceSeen<=3?C.yellow:C.red;
                 return(<tr key={item.id} style={{borderTop:`1px solid ${C.border}`}}>
                   <td style={{padding:"8px 12px 8px 0",color:C.text,fontWeight:600}}>{item.name}</td>
                   <td style={{padding:"8px 12px",color:C.textMid,fontSize:12}}>{item.category}</td>
                   <td style={{padding:"8px 12px",color:item.status==="critical"?C.red:C.text,fontWeight:800,fontFamily:C.font}}>{item.qty}</td>
                   <td style={{padding:"8px 12px",color:C.textMid}}>{item.parLevel}</td>
                   <td style={{padding:"8px 12px"}}><span style={{fontSize:10,fontWeight:700,padding:"2px 6px",borderRadius:3,color:statusColor(item.status),background:statusBg(item.status),fontFamily:C.font}}>{statusLabel(item.status)}</span></td>
-                  <td style={{padding:"8px 0",fontSize:12,fontFamily:C.font,color:days!==null&&days<=30?C.red:days!==null&&days<=90?C.yellow:C.textMid}}>{item.expiry?`${item.expiry} (${days}d)`:"—"}</td>
+                  <td style={{padding:"8px 12px",fontSize:12,fontFamily:C.font,color:days!==null&&days<=30?C.red:days!==null&&days<=90?C.yellow:C.textMid}}>{item.expiry?`${item.expiry} (${days}d)`:"—"}</td>
+                  <td style={{padding:"8px 0",fontSize:11,fontFamily:C.font}}>
+                    {lastSeen
+                      ? <div><div style={{color:seenColor,fontWeight:700}}>{daysSinceSeen===0?"Today":daysSinceSeen===1?"Yesterday":`${daysSinceSeen}d ago`}</div>
+                          <div style={{color:C.textDim,fontSize:10}}>{item.lastSeenBy||"—"}</div></div>
+                      : <span style={{color:C.textDim}}>Not verified</span>
+                    }
+                  </td>
                 </tr>);
               })}</tbody>
             </table>
@@ -1550,6 +1690,51 @@ function SuperintendentDash({templates,submissions,setSubmissions,roster,vehicle
           </div>
         )}
       </Card>
+
+      {/* Inventory discrepancy panel — built from vehicle check submissions */}
+      {(()=>{
+        const discrepSubs=submissions.filter(s=>s.inventorySync&&s.inventorySync.discrepancies&&s.inventorySync.discrepancies.length>0&&s.submittedAt.startsWith(todayStr));
+        if(discrepSubs.length===0) return null;
+        const allDiscrepancies=discrepSubs.flatMap(s=>s.inventorySync.discrepancies.map(d=>({...d,itemUnit:d.unit,submittedBy:s.crewName,vehicleCode:s.inventorySync.unitCode,submittedAt:s.submittedAt})));
+        return(
+          <Card style={{marginBottom:20,border:`1px solid ${C.redBorder}`}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:14}}>⚠️</span>
+                <span style={{fontSize:13,fontWeight:700,color:C.red}}>Inventory Discrepancies — Today</span>
+                <span style={{fontSize:11,fontFamily:C.font,color:C.textDim,marginLeft:4}}>{allDiscrepancies.length} item{allDiscrepancies.length!==1?"s":""} across {discrepSubs.length} vehicle check{discrepSubs.length!==1?"s":""}</span>
+              </div>
+              <Tag label="COUNTS AUTO-UPDATED" color={C.yellow}/>
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {allDiscrepancies.map((d,i)=>(
+                <div key={i} style={{background:C.surfaceRaised,border:`1px solid ${d.diff<0?C.redBorder:C.yellowBorder}`,borderRadius:C.radiusSm,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:700,color:C.text}}>{d.itemName}</div>
+                    <div style={{fontSize:11,color:C.textMid,fontFamily:C.font,marginTop:2}}>{d.vehicleCode} · {d.submittedBy} · {fmtDate(d.submittedAt)}</div>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:16,fontFamily:C.font}}>
+                    <div style={{textAlign:"center"}}>
+                      <div style={{fontSize:9,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>System</div>
+                      <div style={{fontSize:18,fontWeight:800,color:C.textMid}}>{d.expected}</div>
+                    </div>
+                    <div style={{color:C.textDim,fontSize:16}}>→</div>
+                    <div style={{textAlign:"center"}}>
+                      <div style={{fontSize:9,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Physical</div>
+                      <div style={{fontSize:18,fontWeight:800,color:d.diff<0?C.red:C.yellow}}>{d.reported}</div>
+                    </div>
+                    <div style={{textAlign:"center",minWidth:44,background:d.diff<0?C.redDim:C.yellowDim,border:`1px solid ${d.diff<0?C.redBorder:C.yellowBorder}`,borderRadius:C.radiusSm,padding:"4px 8px"}}>
+                      <div style={{fontSize:9,color:C.textDim,textTransform:"uppercase",letterSpacing:"0.06em"}}>Variance</div>
+                      <div style={{fontSize:18,fontWeight:800,color:d.diff<0?C.red:C.yellow}}>{d.diff>0?"+":""}{d.diff}</div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{fontSize:11,color:C.textMid,marginTop:12,borderTop:`1px solid ${C.border}`,paddingTop:10}}>Inventory records have been updated to crew physical counts. Investigate significant negative variances for possible diversion, loss, or documentation errors.</div>
+          </Card>
+        );
+      })()}
 
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:20}}>
         {[{label:"Submissions",val:filtered.length,color:C.blue},{label:"Flagged",val:totalFlagged,color:C.red},{label:"Unacknowledged",val:unacked.length,color:C.orange},{label:"Compliance",val:`${compPct}%`,color:compColor(compPct)}].map(({label,val,color})=>(
@@ -1926,6 +2111,7 @@ function UserManagement({users,setUsers}){
       initial={view==="edit"?selected:null}
       onSave={save}
       onBack={()=>{setView("list");setSelected(null);}}
+      users={users}
     />
   );
 
@@ -2176,6 +2362,10 @@ function UserDetail({user,onBack,onEdit,onSuspend,onReset,onDelete}){
           <InfoRow label="Employee ID"     value={user.employeeId}/>
           <InfoRow label="Email"           value={user.email}/>
           <InfoRow label="Role"            value={user.role}/>
+          <InfoRow label="Platoon"         value={user.platoon||(
+            <span style={{color:C.textDim,fontStyle:"italic",fontSize:12}}>Not assigned</span>
+          )} valueColor={user.platoon?({Blue:C.blue,Green:C.green,Red:C.red,Yellow:C.yellow,Orange:C.orange,Purple:C.purple}[user.platoon]||C.text):undefined}/>
+          <InfoRow label="Reporting Superintendent" value={user.reportingSuperintendent||"Not assigned"}/>
           <InfoRow label="Account Status"  value={user.status} valueColor={user.status==="Active"?C.green:user.status==="Suspended"?C.red:C.textDim}/>
           <InfoRow label="Account Created" value={user.createdAt}/>
           <InfoRow label="Last Login"      value={user.lastLogin||"Never"}/>
@@ -2207,12 +2397,18 @@ function UserDetail({user,onBack,onEdit,onSuspend,onReset,onDelete}){
 }
 
 // ─── User Add / Edit Form ────────────────────────────────────────────────────
-function UserForm({initial,onSave,onBack}){
-  const blank={firstName:"",lastName:"",employeeId:"",email:"",role:"Crew",certLevel:"PCP",station:STATION_NAMES[0],unit:UNITS[0],status:"Active",certExpiry:"",cprExpiry:"",medDirectorAuth:false,notes:"",plainPassword:""};
+const PLATOONS=["","Blue","Green","Red","Yellow","Orange","Purple"];
+
+function UserForm({initial,onSave,onBack,users}){
+  const blank={firstName:"",lastName:"",employeeId:"",email:"",role:"Crew",certLevel:"PCP",station:STATION_NAMES[0],unit:UNITS[0],status:"Active",certExpiry:"",cprExpiry:"",medDirectorAuth:false,notes:"",plainPassword:"",platoon:"",reportingSuperintendent:""};
   const [form,setForm]=useState(initial||blank);
   const set=(k,v)=>setForm(f=>({...f,[k]:v}));
   const isNew=!initial;
   const valid=form.firstName.trim()&&form.lastName.trim()&&form.employeeId.trim()&&form.email.trim()&&(isNew?form.plainPassword.trim():true);
+
+  // Build superintendent list from users prop — anyone with Superintendent role
+  const superintendents=(users||[]).filter(u=>u.role==="Superintendent"&&u.status!=="Inactive");
+  const supOptions=["","...select superintendent...",...superintendents.map(u=>`${u.firstName} ${u.lastName} (${u.employeeId})`)];
 
   const sections=[
     {title:"Personal Information",fields:[
@@ -2226,6 +2422,8 @@ function UserForm({initial,onSave,onBack}){
       {key:"status",      label:"Account Status",       type:"select",options:USER_STATUS},
       {key:"station",     label:"Home Station",         type:"select",options:STATION_NAMES},
       {key:"unit",        label:"Primary Unit",         type:"select",options:UNITS},
+      {key:"platoon",     label:"Platoon",              type:"select",options:PLATOONS},
+      {key:"reportingSuperintendent", label:"Reporting Superintendent", type:"select-dynamic", options:supOptions},
     ]},
     {title:"Credentials",fields:[
       {key:"certLevel",   label:"Certification Level",  type:"select",options:CERT_LEVELS},
@@ -2251,20 +2449,29 @@ function UserForm({initial,onSave,onBack}){
         <Card key={sec.title} style={{marginBottom:16}}>
           <SHdr label={sec.title}/>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
-            {sec.fields.map(f=>(
+            {sec.fields.map(f=>{
+              const platoonColors={Blue:C.blue,Green:C.green,Red:C.red,Yellow:C.yellow,Orange:C.orange,Purple:C.purple};
+              const isPlatoon=f.key==="platoon";
+              return(
               <div key={f.key} style={{gridColumn:f.type==="textarea"?"span 2":"span 1"}}>
                 <label style={{fontSize:12,color:C.textMid,display:"block",marginBottom:5}}>{f.label}</label>
-                {f.type==="select"?(
-                  <select value={form[f.key]||""} onChange={e=>set(f.key,e.target.value)} style={inputSt}>
-                    {(f.options||[]).map(o=><option key={o}>{o}</option>)}
-                  </select>
+                {(f.type==="select"||f.type==="select-dynamic")?(
+                  <div style={{position:"relative"}}>
+                    <select value={form[f.key]||""} onChange={e=>set(f.key,e.target.value)} style={{...inputSt,paddingLeft:isPlatoon&&form[f.key]?36:13}}>
+                      {(f.options||[]).map(o=><option key={o} value={o==="...select superintendent..."?"":o}>{o||"— None —"}</option>)}
+                    </select>
+                    {isPlatoon&&form[f.key]&&(
+                      <div style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",width:14,height:14,borderRadius:"50%",background:platoonColors[form[f.key]]||C.textDim,pointerEvents:"none"}}/>
+                    )}
+                  </div>
                 ):f.type==="textarea"?(
                   <textarea value={form[f.key]||""} onChange={e=>set(f.key,e.target.value)} rows={3} style={{...inputSt,resize:"vertical"}} placeholder={f.placeholder}/>
                 ):(
                   <input type={f.type||"text"} value={form[f.key]||""} onChange={e=>set(f.key,e.target.value)} style={inputSt} placeholder={f.placeholder}/>
                 )}
               </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       ))}
@@ -3035,7 +3242,7 @@ export default function App(){
 
       <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column"}}>
         {activePortal==="home"&&inventory&&<UnifiedDashboard inventory={inventory} orders={orders} waste={waste} submissions={submissions} templates={templates} stations={stations} vehicles={vehicles} invItems={invItems} setPortal={setPortal} setInvView={setInvView} setInvLocation={setInvLocation}/>}
-        {activePortal==="crew"&&inventory&&<CrewPortal session={session} templates={templates} submissions={submissions} setSubmissions={setSubmissions} inventory={inventory} vehicles={vehicles} invItems={invItems}/>}
+        {activePortal==="crew"&&inventory&&<CrewPortal session={session} templates={templates} submissions={submissions} setSubmissions={setSubmissions} inventory={inventory} setInventory={setInventory} vehicles={vehicles} invItems={invItems}/>}
         {activePortal==="inventory"&&inventory&&<InventoryModule inventory={inventory} setInventory={setInventory} orders={orders} setOrders={setOrders} waste={waste} setWaste={setWaste} invView={invView} setInvView={setInvView} invLocation={invLocation} setInvLocation={setInvLocation} stations={stations} setStations={setStations} vehicles={vehicles} setVehicles={setVehicles} invItems={invItems} setInvItems={setInvItems}/>}
         {activePortal==="superintendent"&&<SuperintendentDash templates={templates} submissions={submissions} setSubmissions={setSubmissions} roster={roster} vehicles={vehicles}/>}
         {activePortal==="admin"&&<AdminPortal templates={templates} setTemplates={setTemplates} users={users} setUsers={setUsers} shifts={shifts} setShifts={setShifts}/>}
